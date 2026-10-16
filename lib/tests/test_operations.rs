@@ -32,9 +32,11 @@ use jj_lib::op_walk::OpsetEvaluationError;
 use jj_lib::op_walk::OpsetResolutionError;
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::WorkspaceName;
+use jj_lib::repo::OpContext;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo;
 use jj_lib::settings::UserSettings;
+use jj_lib::workspace_store::WorkspaceType;
 use pollster::FutureExt as _;
 use testutils::CommitBuilderExt as _;
 use testutils::TestRepo;
@@ -81,7 +83,7 @@ fn test_unpublished_operation() -> TestResult {
     let op_id1 = unpublished_op.operation().id().clone();
     assert_ne!(op_id1, op_id0);
     assert_eq!(list_dir(&op_heads_dir), vec![op_id0.hex()]);
-    unpublished_op.publish().block_on()?;
+    unpublished_op.publish(&OpContext::Repo).block_on()?;
     assert_eq!(list_dir(&op_heads_dir), vec![op_id1.hex()]);
     Ok(())
 }
@@ -108,7 +110,7 @@ fn test_consecutive_operations() -> TestResult {
     assert_ne!(op_id1, op_id0);
     assert_eq!(list_dir(&op_heads_dir), vec![op_id1.hex()]);
 
-    let repo = repo.reload_at_head(None).block_on()?;
+    let repo = repo.reload_at_head(&OpContext::Repo).block_on()?;
     let mut tx2 = repo.start_transaction();
     write_random_commit(tx2.repo_mut());
     let op_id2 = tx2
@@ -123,7 +125,7 @@ fn test_consecutive_operations() -> TestResult {
 
     // Reloading the repo makes no difference (there are no conflicting operations
     // to resolve).
-    let _repo = repo.reload_at_head(None).block_on()?;
+    let _repo = repo.reload_at_head(&OpContext::Repo).block_on()?;
     assert_eq!(list_dir(&op_heads_dir), vec![op_id2.hex()]);
     Ok(())
 }
@@ -170,7 +172,10 @@ fn test_concurrent_operations() -> TestResult {
 
     // Reloading the repo causes the operations to be merged
     let repo = repo
-        .reload_at_head(Some(WorkspaceName::DEFAULT))
+        .reload_at_head(&OpContext::Workspace {
+            name: WorkspaceName::DEFAULT.to_owned(),
+            workspace_type: WorkspaceType::Regular,
+        })
         .block_on()?;
     let merged_op_id = repo.op_id().clone();
     assert_ne!(merged_op_id, op_id0);
@@ -231,7 +236,10 @@ fn test_isolation() -> TestResult {
     assert_heads(repo.as_ref(), vec![initial.id()]);
     // After reload, the base repo sees both rewrites.
     let repo = repo
-        .reload_at_head(Some(WorkspaceName::DEFAULT))
+        .reload_at_head(&OpContext::Workspace {
+            name: WorkspaceName::DEFAULT.to_owned(),
+            workspace_type: WorkspaceType::Regular,
+        })
         .block_on()?;
     assert_heads(repo.as_ref(), vec![rewrite1.id(), rewrite2.id()]);
     Ok(())
@@ -655,18 +663,28 @@ fn test_resolve_op_id() -> TestResult {
     // "0" is ambiguous with the root operation (operations[6])
     insta::assert_debug_snapshot!(operations.iter().map(|op| op.id().hex()).collect_vec(), @r#"
     [
-        "33d54aefeb762fec7d849fba6cdb19e4f571f9b0a14445c9ab764d800d52c7abbe9d6bb8a152a6e2b02514de2ca769038c8e3ec0093d254369d1c138eaf5b02a",
-        "13f64f9b2c7a8a882f3e5e03885cdc0cb64c8bc40e6f2b6f188c84a4ac49f9e6f1e49e5b3a1c627ef8c077184ea870e532a06554c9e9783bf78338a5e4c0b781",
-        "b1e7aa2b8e7d6015d7f281baadb1f34bdbb8841a762a7e164f7849973ace8d0b8f87309416ccc81c0459373846022c24a93486f8a4ed2ff0ec4221b587ca28f2",
-        "c9cc85d1bf80aa756583a1ba708961f94643277ae716d913b17152e80b42f1886afd1127ec8e34fc15507040ec5a643e32d4b727ea70417ba2fbb29e2e225f88",
-        "94cfe4b05e25e4329dcd2494e0e4a4e4a6608c65ccc9d0a186c81d3bf8f5606ec7b31cd9333dcacbc658ebe0df5e51f91d2d52b58a5806e1273d31c083e4acd6",
-        "b527c15f0261c2520ffe84056f8eb3a216a9994b7117fe17b996f7203bb3cebeace369461f481c412f9969a91490dc5af629efe109c3433afa0c6d0b26fdbc17",
-        "007480c57328c8532149d66fb2a44b6e4ff79e44362e0c9578f82c4147c8cbebf84ad08d9a1f661814902cef89bc76d90628cb606f2431e45f74493d5e1e0cbd",
+        "ce789b2070178f31e22453198362ba58a24e8448b46f244198adfdaddfa1db43c138b796c88cf6c70a4fd14c7dda6cd90d98385490578c8139f750094e77f020",
+        "55802fd6840b8966e119c56c60997444731693ac5cbe847639e583f4a5f50a66084722e4940629becac862cb89a158a027c0716a8b2a17ba99249a0c633f3d9c",
+        "fb9dd094c1a98865e74c8d45af591d663338d333f14482500013dfc819103c3dfaaf40d3556d2956d6ec360c396a47de028c288e51c3fcf0639ee1e274cad1a3",
+        "34cd2937b8a1b63bed0c7a2bf183f0927e71d1fca960eaba0beab0cbb49c2d4389fbf1201867c9881975143ac41d6f71ed47e6ec508fa9e17c274dacb1848dca",
+        "b450f3c70c08add91262de8f294e728a562c60710818420b04c39537f32113bc5422d3b385ee2432eb0d71972d57b7cd2295b77b3111e97f0a656676ff37ee14",
+        "22df3a1863f6ae1c395295c6311fa75ea86aec3163c1b8618a1516256adeb3f3f1e5369bbd663d529bdc2bdf04b0a5918238eaa39ac0cb49bfd23bde43196c0a",
+        "c47f4dc41642dcab59a844395f6a4061075df5474fcdb4dd96a9d5cbb1f608984af4abf57dc48da137a3aa8ccc383ec04298cea88cfb661cfcdf57ccebbc0d49",
     ]
     "#);
 
     let repo_loader = repo.loader();
-    let resolve = |op_str: &str| op_walk::resolve_op_for_load(repo_loader, op_str).block_on();
+    let resolve = |op_str: &str| {
+        op_walk::resolve_op_for_load(
+            repo_loader,
+            &OpContext::Workspace {
+                name: WorkspaceName::DEFAULT.to_owned(),
+                workspace_type: WorkspaceType::Regular,
+            },
+            op_str,
+        )
+        .block_on()
+    };
 
     // Full id
     assert_eq!(resolve(&operations[0].id().hex())?, operations[0]);

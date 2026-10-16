@@ -32,6 +32,7 @@ use futures::TryStreamExt as _;
 use futures::future::try_join_all;
 use futures::stream;
 use itertools::Itertools as _;
+use jj_core::workspace_store::WorkspaceType;
 use once_cell::sync::OnceCell;
 use thiserror::Error;
 use tracing::instrument;
@@ -160,6 +161,26 @@ pub trait Repo {
     ) -> IndexResult<usize>;
 }
 
+#[derive(Debug, Clone)]
+pub enum OpContext {
+    /// The operation is running outside of any workspace
+    Repo,
+    /// The operation is running  in a workspace
+    Workspace {
+        name: WorkspaceNameBuf,
+        workspace_type: WorkspaceType,
+    },
+}
+
+impl OpContext {
+    pub fn maybe_workspace_name(&self) -> Option<&WorkspaceName> {
+        match self {
+            Self::Repo => None,
+            Self::Workspace { name, .. } => Some(name),
+        }
+    }
+}
+
 pub struct ReadonlyRepo {
     loader: RepoLoader,
     operation: Operation,
@@ -200,7 +221,9 @@ impl ReadonlyRepo {
 
     pub fn default_op_heads_store_initializer() -> &'static OpHeadsStoreInitializer<'static> {
         &|_settings, store_path, root_op_id| {
-            Ok(Box::new(SimpleOpHeadsStore::init(store_path, root_op_id)?))
+            Ok(Box::new(SimpleOpHeadsStore::init_op_heads_store(
+                store_path, root_op_id,
+            )?))
         }
     }
 
@@ -350,16 +373,28 @@ impl ReadonlyRepo {
         self.loader.settings()
     }
 
+    // TODO: XXX:W migrate most callers to start_transaction_new and get rid of this method.
     pub fn start_transaction(self: &Arc<Self>) -> Transaction {
+        self.start_transaction_new(None)
+    }
+
+    pub fn start_transaction_new(
+        self: &Arc<Self>,
+        workspace_name: Option<&WorkspaceName>,
+    ) -> Transaction {
         let mut_repo = MutableRepo::new(self.clone(), self.readonly_index(), &self.view);
-        Transaction::new(mut_repo, self.settings())
+        let mut tx = Transaction::new(mut_repo, self.settings());
+        if let Some(workspace_name) = workspace_name {
+            tx.set_workspace_name(workspace_name);
+        }
+        tx
     }
 
     pub async fn reload_at_head(
         &self,
-        workspace_name: Option<&WorkspaceName>,
+        op_context: &OpContext,
     ) -> Result<Arc<Self>, RepoLoaderError> {
-        self.loader().load_at_head(workspace_name).await
+        self.loader().load_at_head(op_context).await
     }
 
     #[instrument]
@@ -764,15 +799,15 @@ impl RepoLoader {
         let submodule_store = Arc::from(
             store_factories.load_submodule_store(settings, &repo_path.join("submodule_store"))?,
         );
-        Ok(Self {
-            settings: settings.clone(),
+        Ok(Self::new(
+            settings.clone(),
             store,
             workspace_store,
             op_store,
             op_heads_store,
             index_store,
             submodule_store,
-        })
+        ))
     }
 
     pub fn settings(&self) -> &UserSettings {
@@ -805,19 +840,20 @@ impl RepoLoader {
 
     pub async fn load_at_head(
         &self,
-        workspace_name: Option<&WorkspaceName>,
+        op_context: &OpContext,
     ) -> Result<Arc<ReadonlyRepo>, RepoLoaderError> {
         let op = op_heads_store::resolve_op_heads(
             self.op_heads_store.as_ref(),
             &self.op_store,
-            async |op_heads| -> Result<Operation, RepoLoaderError> {
+            op_context,
+            async |op_heads, op_context| -> Result<Operation, RepoLoaderError> {
                 assert!(op_heads.len() > 1);
                 let transaction_description = Some("reconcile divergent operations");
                 let transaction_attributes = [];
                 let (merged_repo, _num_rebased) = self
                     .merge_operations(
                         op_heads,
-                        workspace_name,
+                        op_context.maybe_workspace_name(),
                         transaction_description,
                         transaction_attributes,
                     )
@@ -908,10 +944,10 @@ impl RepoLoader {
         // the arguments to that method.
         let mut closest_common_ancestors: HashMap<_, Vec<Operation>> = HashMap::new();
 
-        let mut tx = self.load_at(&operations[0]).await?.start_transaction();
-        if let Some(workspace_name) = workspace_name {
-            tx.set_workspace_name(workspace_name);
-        }
+        let mut tx = self
+            .load_at(&operations[0])
+            .await?
+            .start_transaction_new(workspace_name);
         for (key, value) in transaction_attributes {
             tx.set_attribute(key, value);
         }
@@ -981,7 +1017,10 @@ impl RepoLoader {
             stack.push((index, operations, tx));
             // Then we push the ancestor ops to the stack so that we can merge them first.
             // We need to start a separate transaction for this.
-            let new_tx = self.load_at(&ancestor_ops[0]).await?.start_transaction();
+            let new_tx = self
+                .load_at(&ancestor_ops[0])
+                .await?
+                .start_transaction_new(workspace_name);
             stack.push((1, ancestor_ops.clone(), new_tx));
         }
 
@@ -2042,6 +2081,29 @@ impl MutableRepo {
     pub fn set_view(&mut self, data: op_store::View) {
         let head_normalized = false;
         self.view.set_view(data, head_normalized);
+    }
+
+    pub async fn set_view_for_new_independent_workspace(
+        &mut self,
+        workspace_name: &WorkspaceName,
+        new_wc_commit: &Commit,
+    ) -> BackendResult<()> {
+        let other_wc_commits = self.view.wc_commit_ids().keys().cloned().collect_vec();
+        let previous_heads = self.view.heads().clone();
+        for workspace in other_wc_commits {
+            if workspace != workspace_name {
+                self.view.remove_workspace(&workspace);
+            }
+        }
+        self.add_head(new_wc_commit).await?;
+        for head in previous_heads {
+            if head != *new_wc_commit.id() {
+                self.remove_head(&head);
+            }
+        }
+        self.view
+            .set_wc_commit(workspace_name.to_owned(), new_wc_commit.id().clone());
+        Ok(())
     }
 
     pub async fn merge(

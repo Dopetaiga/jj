@@ -45,13 +45,18 @@ pub async fn cmd_op_integrate(
     let repo_loader = workspace_command.repo().loader();
     repo_loader
         .op_heads_store()
-        .update_op_heads(target_op.parent_ids(), target_op.id())
+        .update_op_heads(
+            &workspace_command.op_context(),
+            target_op.parent_ids(),
+            target_op.id(),
+        )
         .await?;
 
     op_heads_store::resolve_op_heads(
         repo_loader.op_heads_store().as_ref(),
         repo_loader.op_store(),
-        async |op_heads| -> Result<Operation, CommandError> {
+        &workspace_command.op_context(),
+        async |op_heads, _op_context| -> Result<Operation, CommandError> {
             // TODO: It may be helpful to print each operation we're merging here
             let transaction_description = "reconcile divergent operations";
             let merged_operation = merge_operations(

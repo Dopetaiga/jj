@@ -21,12 +21,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use jj_core::workspace_store::WorkspaceType;
 use thiserror::Error;
 
 use crate::backend::BackendInitError;
 use crate::commit::Commit;
 use crate::default_backend_factories::default_working_copy_factory;
-use crate::default_backend_factories::default_workspace_loader_factory;
 use crate::file_util;
 use crate::file_util::BadPathEncoding;
 use crate::file_util::IoResultExt as _;
@@ -40,6 +40,7 @@ use crate::ref_name::WorkspaceNameBuf;
 use crate::repo::BackendInitializer;
 use crate::repo::CheckOutCommitError;
 use crate::repo::IndexStoreInitializer;
+use crate::repo::OpContext;
 use crate::repo::OpHeadsStoreInitializer;
 use crate::repo::OpStoreInitializer;
 use crate::repo::ReadonlyRepo;
@@ -96,8 +97,12 @@ pub enum WorkspaceLoadError {
     RepoDoesNotExist(PathBuf),
     #[error("There is no Jujutsu repo in {0}")]
     NoWorkspaceHere(PathBuf),
+    #[error("The workspace at {0} has been forgetten")]
+    WorkspaceNotInRepo(PathBuf),
     #[error("Cannot read the repo")]
     StoreLoadError(#[from] StoreLoadError),
+    #[error(transparent)]
+    WorkspaceStoreError(#[from] WorkspaceStoreError),
     #[error("Repo path could not be decoded")]
     DecodeRepoPath(#[source] BadPathEncoding),
     #[error(transparent)]
@@ -116,6 +121,7 @@ pub struct Workspace {
     // Path to the workspace root (typically the parent of a .jj/ directory), which is where
     // working copy files live.
     workspace_root: PathBuf,
+    workspace_type: WorkspaceType,
     repo_path: PathBuf,
     repo_loader: RepoLoader,
     working_copy: Box<dyn WorkingCopy>,
@@ -142,7 +148,7 @@ async fn init_working_copy(
     let working_copy_state_path = jj_dir.join("working_copy");
     std::fs::create_dir(&working_copy_state_path).context(&working_copy_state_path)?;
 
-    let mut tx = repo.start_transaction();
+    let mut tx = repo.start_transaction_new(None);
     tx.repo_mut()
         .check_out(workspace_name.clone(), &repo.store().root_commit())
         .await?;
@@ -167,36 +173,25 @@ impl Workspace {
     pub fn new(
         workspace_root: &Path,
         repo_path: PathBuf,
+        workspace_type: WorkspaceType,
         working_copy: Box<dyn WorkingCopy>,
         repo_loader: RepoLoader,
     ) -> Result<Self, PathError> {
         let workspace_root = dunce::canonicalize(workspace_root).context(workspace_root)?;
-        Ok(Self::new_no_canonicalize(
+        Ok(Self {
             workspace_root,
-            repo_path,
-            working_copy,
-            repo_loader,
-        ))
-    }
-
-    pub fn new_no_canonicalize(
-        workspace_root: PathBuf,
-        repo_path: PathBuf,
-        working_copy: Box<dyn WorkingCopy>,
-        repo_loader: RepoLoader,
-    ) -> Self {
-        Self {
-            workspace_root,
+            workspace_type,
             repo_path,
             repo_loader,
             working_copy,
-        }
+        })
     }
 
     pub async fn init_simple(
         user_settings: &UserSettings,
         workspace_root: &Path,
         workspace_name: &WorkspaceName,
+        workspace_type: WorkspaceType,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let backend_initializer: &BackendInitializer =
             &|_settings, store_path| Ok(Box::new(SimpleBackend::init(store_path)));
@@ -205,6 +200,7 @@ impl Workspace {
             user_settings,
             workspace_root,
             workspace_name,
+            workspace_type,
             backend_initializer,
             signer,
         )
@@ -218,6 +214,7 @@ impl Workspace {
         user_settings: &UserSettings,
         workspace_root: &Path,
         workspace_name: &WorkspaceName,
+        workspace_type: WorkspaceType,
         object_hash: gix::hash::Kind,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let backend_initializer: &BackendInitializer = &|settings, store_path| {
@@ -232,6 +229,7 @@ impl Workspace {
             user_settings,
             workspace_root,
             workspace_name,
+            workspace_type,
             backend_initializer,
             signer,
         )
@@ -245,6 +243,7 @@ impl Workspace {
         user_settings: &UserSettings,
         workspace_root: &Path,
         workspace_name: &WorkspaceName,
+        workspace_type: WorkspaceType,
         object_hash: gix::hash::Kind,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let backend_initializer = |settings: &UserSettings,
@@ -272,6 +271,7 @@ impl Workspace {
             user_settings,
             workspace_root,
             workspace_name,
+            workspace_type,
             &backend_initializer,
             signer,
         )
@@ -287,6 +287,7 @@ impl Workspace {
         user_settings: &UserSettings,
         workspace_root: &Path,
         workspace_name: &WorkspaceName,
+        workspace_type: WorkspaceType,
         git_repo_path: &Path,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let backend_initializer = |settings: &UserSettings,
@@ -320,6 +321,7 @@ impl Workspace {
             user_settings,
             workspace_root,
             workspace_name,
+            workspace_type,
             &backend_initializer,
             signer,
         )
@@ -331,6 +333,7 @@ impl Workspace {
         user_settings: &UserSettings,
         workspace_root: &Path,
         workspace_name: &WorkspaceName,
+        workspace_type: WorkspaceType,
         backend_initializer: &BackendInitializer<'_>,
         signer: Signer,
         workspace_store_initializer: &WorkspaceStoreInitializer<'_>,
@@ -361,6 +364,14 @@ impl Workspace {
                 RepoInitError::OpHeadsStore(err) => WorkspaceInitError::OpHeadsStore(err),
                 RepoInitError::Path(err) => WorkspaceInitError::Path(err),
             })?;
+            let op_context = OpContext::Workspace {
+                name: workspace_name.to_owned(),
+                workspace_type,
+            };
+            repo.op_heads_store()
+                .init_op_heads(&op_context, repo.op_store().root_operation_id())
+                .await
+                .map_err(WorkspaceInitError::OpHeadsStore)?;
             let (working_copy, repo) = init_working_copy(
                 &repo,
                 workspace_root,
@@ -371,10 +382,18 @@ impl Workspace {
             .await?;
             let repo_loader = repo.loader().clone();
             let repo_dir = dunce::canonicalize(&repo_dir).context(&repo_dir)?;
-            let workspace = Self::new(workspace_root, repo_dir, working_copy, repo_loader)?;
-            repo.loader()
-                .workspace_store()
-                .add(workspace.workspace_name(), workspace.workspace_root())?;
+            let workspace = Self::new(
+                workspace_root,
+                repo_dir,
+                workspace_type,
+                working_copy,
+                repo_loader,
+            )?;
+            repo.loader().workspace_store().add(
+                workspace.workspace_name(),
+                workspace.workspace_root(),
+                workspace.workspace_type(),
+            )?;
             Ok((workspace, repo))
         }
         .await
@@ -387,6 +406,7 @@ impl Workspace {
         user_settings: &UserSettings,
         workspace_root: &Path,
         workspace_name: &WorkspaceName,
+        workspace_type: WorkspaceType,
         backend_initializer: &BackendInitializer<'_>,
         signer: Signer,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
@@ -394,6 +414,7 @@ impl Workspace {
             user_settings,
             workspace_root,
             workspace_name,
+            workspace_type,
             backend_initializer,
             signer,
             ReadonlyRepo::default_workspace_store_initializer(),
@@ -412,6 +433,7 @@ impl Workspace {
         repo: &Arc<ReadonlyRepo>,
         working_copy_factory: &dyn WorkingCopyFactory,
         workspace_name: WorkspaceNameBuf,
+        workspace_type: WorkspaceType,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let jj_dir = create_jj_dir(workspace_root)?;
 
@@ -427,7 +449,14 @@ impl Workspace {
             file_util::path_to_bytes(&path_to_store).map_err(WorkspaceInitError::EncodeRepoPath)?;
         let repo_file_path = jj_dir.join("repo");
         fs::write(&repo_file_path, repo_dir_bytes).context(&repo_file_path)?;
-
+        let op_context = OpContext::Workspace {
+            name: workspace_name.clone(),
+            workspace_type,
+        };
+        repo.op_heads_store()
+            .init_op_heads(&op_context, repo.op_store().root_operation_id())
+            .await
+            .map_err(WorkspaceInitError::OpHeadsStore)?;
         let workspace_store = repo.loader().workspace_store();
         let (working_copy, repo) = init_working_copy(
             repo,
@@ -440,20 +469,26 @@ impl Workspace {
         let workspace = Self::new(
             workspace_root,
             repo_dir,
+            workspace_type,
             working_copy,
             repo.loader().clone(),
         )?;
-        workspace_store.add(workspace.workspace_name(), workspace.workspace_root())?;
+        workspace_store.add(
+            workspace.workspace_name(),
+            workspace.workspace_root(),
+            workspace.workspace_type(),
+        )?;
         Ok((workspace, repo))
     }
 
     pub fn load(
         user_settings: &UserSettings,
         workspace_path: &Path,
+        workspace_loader_factory: &dyn WorkspaceLoaderFactory,
         store_factories: &StoreFactories,
         working_copy_factories: &WorkingCopyFactories,
     ) -> Result<Self, WorkspaceLoadError> {
-        let loader = default_workspace_loader_factory().create(workspace_path)?;
+        let loader = workspace_loader_factory.create(workspace_path)?;
         let workspace = loader.load(user_settings, store_factories, working_copy_factories)?;
         Ok(workspace)
     }
@@ -464,6 +499,17 @@ impl Workspace {
 
     pub fn workspace_name(&self) -> &WorkspaceName {
         self.working_copy.workspace_name()
+    }
+
+    pub fn workspace_type(&self) -> WorkspaceType {
+        self.workspace_type
+    }
+
+    pub fn op_context(&self) -> OpContext {
+        OpContext::Workspace {
+            name: self.workspace_name().to_owned(),
+            workspace_type: self.workspace_type(),
+        }
     }
 
     pub fn repo_path(&self) -> &Path {
@@ -485,7 +531,10 @@ impl Workspace {
 
     pub async fn load_at_head(&self) -> Result<Arc<ReadonlyRepo>, RepoLoaderError> {
         self.repo_loader()
-            .load_at_head(Some(self.workspace_name()))
+            .load_at_head(&OpContext::Workspace {
+                name: self.workspace_name().to_owned(),
+                workspace_type: self.workspace_type(),
+            })
             .await
     }
 
@@ -660,6 +709,14 @@ impl WorkspaceLoader for DefaultWorkspaceLoader {
     ) -> Result<Workspace, WorkspaceLoadError> {
         let repo_loader =
             RepoLoader::init_from_file_system(user_settings, &self.repo_path, store_factories)?;
+        let Some(workspace_metadata) = repo_loader
+            .workspace_store()
+            .get_workspace_metadata_by_workspace_path(&self.workspace_root)?
+        else {
+            return Err(WorkspaceLoadError::WorkspaceNotInRepo(
+                self.workspace_root.clone(),
+            ));
+        };
         let working_copy_factory = get_working_copy_factory(self, working_copy_factories)?;
         let working_copy = working_copy_factory.load_working_copy(
             repo_loader.store().clone(),
@@ -670,6 +727,7 @@ impl WorkspaceLoader for DefaultWorkspaceLoader {
         let workspace = Workspace::new(
             &self.workspace_root,
             self.repo_path.clone(),
+            workspace_metadata.workspace_type(),
             working_copy,
             repo_loader,
         )?;
