@@ -1104,7 +1104,7 @@ impl Backend for GitBackend {
     }
 
     fn concurrency(&self) -> usize {
-        1
+        if fake_latency().is_some() { 100 } else { 1 }
     }
 
     async fn read_file(
@@ -1112,6 +1112,7 @@ impl Backend for GitBackend {
         _path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn AsyncRead + Send>>> {
+        simulate_read_latency("file", id).await;
         let data = self.read_file_sync(id)?;
         Ok(Box::pin(Cursor::new(data)))
     }
@@ -1129,6 +1130,7 @@ impl Backend for GitBackend {
     }
 
     async fn read_symlink(&self, _path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
+        simulate_read_latency("symlink", id).await;
         let locked_repo = self.lock_git_repo();
         let git_blob_id = validate_git_object_id(&locked_repo, id)?;
         let mut blob = locked_repo
@@ -1169,6 +1171,7 @@ impl Backend for GitBackend {
         if id == &self.empty_tree_id {
             return Ok(Tree::default());
         }
+        simulate_read_latency("tree", id).await;
 
         let locked_repo = self.lock_git_repo();
         let git_tree_id = validate_git_object_id(&locked_repo, id)?;
@@ -1291,6 +1294,7 @@ impl Backend for GitBackend {
             ));
         }
 
+        simulate_read_latency("commit", id).await;
         let mut commit = {
             let locked_repo = self.lock_git_repo();
             let git_commit_id = validate_git_object_id(&locked_repo, id)?;
@@ -1665,6 +1669,36 @@ recover.
             source: Box::new(err),
         })?;
     Ok(id.detach())
+}
+
+/// Simulated per-read latency for benchmarking concurrency. Set
+/// `JJ_GIT_BACKEND_FAKE_LATENCY_MS` to enable.
+// TODO: Remove before merging. This is only for local experiments.
+fn fake_latency() -> Option<std::time::Duration> {
+    static LATENCY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *LATENCY.get_or_init(|| {
+        let ms: u64 = std::env::var("JJ_GIT_BACKEND_FAKE_LATENCY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(std::time::Duration::from_millis(ms))
+    })
+}
+
+/// Runtime-agnostic sleep (the CLI drives futures with pollster, so there's
+/// no tokio timer available). Spawns a thread per sleep, which is fine for
+/// experiments.
+async fn simulate_read_latency(kind: &str, id: &impl ObjectId) {
+    let Some(duration) = fake_latency() else {
+        return;
+    };
+    eprintln!("fake-latency-read {kind} {}", id.hex());
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(duration);
+        sender.send(()).ok();
+    });
+    receiver.await.ok();
 }
 
 #[cfg(test)]
